@@ -4,6 +4,13 @@ import modelscope_studio.components.antd as antd
 import modelscope_studio.components.pro as pro
 import modelscope_studio.components.antdx as antdx
 import json
+import queue
+import threading
+from voice_processor import VoiceProcessor
+
+voice_queue = queue.Queue()
+voice_processor = None
+import whisper
 from langchain.chat_models import init_chat_model
 from exceptiongroup import ExceptionGroup
 from ui_components.config_form import ConfigForm
@@ -12,6 +19,14 @@ from mcp_client import generate_with_mcp, get_mcp_prompts
 from config import bot_config, default_mcp_config, default_mcp_prompts, default_mcp_servers, user_config, welcome_config, default_theme, default_locale, bot_avatars, primary_color, mcp_prompt_model
 from env import api_key, internal_mcp_config, llm_api_key, llm_base_url, llm_model_name
 
+# whisper_model = whisper.load_model("medium", device="cuda", download_root="./whisper_models")
+
+# def transcribe_audio(audio_filepath):
+#     if audio_filepath is None:
+#         return ""
+#     # 指定语言为简体中文，提高转录准确性
+#     result = whisper_model.transcribe(audio_filepath, language='zh')
+#     return result["text"]
 
 def merge_mcp_config(mcp_config1, mcp_config2):
     return {
@@ -20,6 +35,15 @@ def merge_mcp_config(mcp_config1, mcp_config2):
             **mcp_config2.get("mcpServers", {})
         }
     }
+
+
+def safe_json_loads(json_str_or_dict):
+    if isinstance(json_str_or_dict, dict):
+        return json_str_or_dict
+    try:
+        return json.loads(json_str_or_dict)
+    except (json.JSONDecodeError, TypeError):
+        return {}
 
 
 def format_messages(messages):
@@ -41,6 +65,27 @@ def format_messages(messages):
                 ])
             })
     return formatted_messages
+
+def handle_voice_input(text_input, status_tag):
+    try:
+        item = voice_queue.get_nowait()
+        if item["type"] == "text":
+            text_input = item["text"]
+            return gr.update(value=text_input), gr.update(value="识别成功", color="green")
+        elif item["type"] == "status":
+            return gr.update(), gr.update(value=item["text"], color=item["color"])
+        elif item["type"] == "submit":
+            # Trigger the submit function
+            return gr.update(value=item["text"], trigger=True), gr.update(value="识别成功", color="green")
+    except queue.Empty:
+        pass
+    return gr.update(), gr.update()
+
+def start_voice_processor():
+    global voice_processor
+    voice_processor = VoiceProcessor(voice_queue)
+    # Use a daemon thread to ensure it exits when the main app exits
+    threading.Thread(target=voice_processor.start, daemon=True).start()
 
 
 async def submit(input_value, config_form_value, mcp_config_value,
@@ -86,7 +131,7 @@ async def submit(input_value, config_form_value, mcp_config_value,
         tool_content = ""
         async for chunk in generate_with_mcp(
                 format_messages(chatbot_value[:-1]),
-                mcp_config=merge_mcp_config(json.loads(mcp_config_value),
+                mcp_config=merge_mcp_config(safe_json_loads(mcp_config_value),
                                             internal_mcp_config),
                 enabled_mcp_servers=enabled_mcp_servers,
                 sys_prompt=sys_prompt,
@@ -402,6 +447,9 @@ with gr.Blocks(css=css) as demo:
                             elem_style=dict(flex=1))
                     with antdx.Sender() as input:
                         with ms.Slot("prefix"):
+                            with antd.Flex(gap="small", align="center"):
+                                voice_switch = antd.Switch(value=False)
+                                voice_status_tag = antd.Tag("休眠中", color="gray")
                             with antd.Button(value=None,
                                              variant="text",
                                              color="default") as clear_btn:
@@ -422,7 +470,20 @@ with gr.Blocks(css=css) as demo:
         js=
         "(mcp_servers_btn_value, browser_state_value) => [mcp_servers_btn_value, browser_state_value, decodeURIComponent(new URLSearchParams(window.location.search).get('studio_additional_params') || '') || null]",
         inputs=[mcp_servers_btn, browser_state, url_mcp_config],
-        outputs=[mcp_config, chatbot, mcp_servers_btn])
+        outputs=[mcp_config, chatbot, mcp_servers_btn]).then(
+            fn=start_voice_processor
+        )
+    
+    gr.Timer(0.1).tick(
+        fn=handle_voice_input,
+        inputs=[input],
+        outputs=[input, voice_status_tag]
+    )
+
+    voice_switch.change(
+        fn=lambda x: voice_processor.start() if x else voice_processor.stop(),
+        inputs=[voice_switch]
+    )
 
     chatbot.welcome_prompt_select(fn=select_welcome_prompt,
                                   outputs=[input],
